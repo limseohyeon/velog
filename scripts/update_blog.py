@@ -1,45 +1,113 @@
-import feedparser
-import git
 import os
+import re
+import git
+import json
+import unicodedata
+import hashlib
+import requests
+from datetime import datetime
 
-# 벨로그 RSS 피드 URL
-# example : rss_url = 'https://api.velog.io/rss/@rimgosu'
-rss_url = 'https://api.velog.io/rss/@limseohyeon'
+# ===== 설정 =====
+GRAPHQL_ENDPOINT = "https://v2.velog.io/graphql"  # Velog GraphQL 엔드포인트
+USERNAME = "limseohyeon"                           # Velog 아이디
+REPO_PATH = "."
+OUT_DIR = os.path.join(REPO_PATH, "velog-posts")
 
-# 깃허브 레포지토리 경로
-repo_path = '.'
+# ===== 유틸 =====
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
-# 'velog-posts' 폴더 경로
-posts_dir = os.path.join(repo_path, 'velog-posts')
+def slugify(text: str) -> str:
+    text = unicodedata.normalize('NFKD', text).strip()
+    text = re.sub(r'[\\/:*?"<>|]+', '-', text)
+    text = re.sub(r'\s+', '-', text)
+    text = re.sub(r'-{2,}', '-', text)
+    return text.strip('-')
 
-# 'velog-posts' 폴더가 없다면 생성
-if not os.path.exists(posts_dir):
-    os.makedirs(posts_dir)
+def file_changed(path: str, new_text: str) -> bool:
+    if not os.path.exists(path):
+        return True
+    with open(path, 'r', encoding='utf-8') as f:
+        old = f.read()
+    return hashlib.sha256(old.encode('utf-8')).hexdigest() != hashlib.sha256(new_text.encode('utf-8')).hexdigest()
 
-# 레포지토리 로드
-repo = git.Repo(repo_path)
+def fetch_posts(username: str, limit: int = 200):
+    """
+    Velog GraphQL: 사용자 글 목록 + 시리즈 정보
+    페이징이 필요하면 cursor 기반으로 더 가져오도록 확장 가능.
+    """
+    query = """
+    query($username: String!, $limit: Int!) {
+      posts(username: $username, limit: $limit) {
+        id
+        title
+        body
+        short_description
+        released_at
+        updated_at
+        url_slug
+        tags
+        series {
+          name
+          url_slug
+        }
+        link
+      }
+    }
+    """
+    variables = {"username": username, "limit": limit}
+    r = requests.post(GRAPHQL_ENDPOINT, json={"query": query, "variables": variables}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data:
+        raise RuntimeError(data["errors"])
+    return data["data"]["posts"]
 
-# RSS 피드 파싱
-feed = feedparser.parse(rss_url)
+# ===== 메인 =====
+ensure_dir(OUT_DIR)
+repo = git.Repo(REPO_PATH)
 
-# 각 글을 파일로 저장하고 커밋
-for entry in feed.entries:
-    # 파일 이름에서 유효하지 않은 문자 제거 또는 대체
-    file_name = entry.title
-    file_name = file_name.replace('/', '-')  # 슬래시를 대시로 대체
-    file_name = file_name.replace('\\', '-')  # 백슬래시를 대시로 대체
-    # 필요에 따라 추가 문자 대체
-    file_name += '.md'
-    file_path = os.path.join(posts_dir, file_name)
+posts = fetch_posts(USERNAME, limit=500)  # 필요시 더 크게/페이징
 
-    # 파일이 이미 존재하지 않으면 생성
-    if not os.path.exists(file_path):
-        with open(file_path, 'w', encoding='utf-8') as file:
-            file.write(entry.description)  # 글 내용을 파일에 작성
+for p in posts:
+    title = p["title"].strip()
+    body = p.get("body") or p.get("short_description") or ""
+    released_at = p.get("released_at") or p.get("updated_at")
+    # released_at이 None일 수도 있으니 안전 처리
+    date_iso = (released_at or datetime.utcnow().isoformat())
+    date_prefix = date_iso[:10]
 
-        # 깃허브 커밋
-        repo.git.add(file_path)
-        repo.git.commit('-m', f'Add post: {entry.title}')
+    series = (p.get("series") or {}).get("name") or "_no-series"
+    series_slug = slugify(series)
+    title_slug = slugify(title)
 
-# 변경 사항을 깃허브에 푸시
-repo.git.push()
+    series_dir = os.path.join(OUT_DIR, series_slug)
+    ensure_dir(series_dir)
+
+    filename = f"{date_prefix}_{title_slug}.md"
+    path = os.path.join(series_dir, filename)
+
+    link = p.get("link") or f"https://velog.io/@{USERNAME}/{p.get('url_slug','')}"
+    tags = p.get("tags") or []
+
+    front_matter = [
+        '---',
+        f'title: "{title}"',
+        f'date: "{date_iso}"',
+        f'series: "{series}"',
+        f'link: "{link}"',
+        f'tags: [{", ".join([f\'"{slugify(str(x))}"\' for x in tags])}]',
+        '---',
+        ''
+    ]
+    content = "\n".join(front_matter) + body
+
+    if file_changed(path, content):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        repo.git.add(path)
+        repo.git.commit('-m', f'Velog sync: [{series}] {title}')
+
+# push
+origin = repo.remote(name='origin')
+origin.push()
